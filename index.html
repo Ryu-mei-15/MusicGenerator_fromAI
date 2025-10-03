@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Text→Melody（ABC）</title>
+<style>
+  :root{
+    --bg:#f0f8ff;        /* 背景を淡い青 */
+    --card:#ffffff;      
+    --fg:#0f172a;        
+    --muted:#64748b;     
+    --line:#e5e7eb;      
+    --accent:#2563eb;    /* メインボタン青 */
+    --accent-2:#93c5fd;  /* 薄い青 */
+    --accent-3:#dbeafe;  
+    --ok:#3b82f6;        
+    --warn:#f59e0b;      
+    --err:#ef4444;       
+  }
+
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+  header{padding:16px 20px;border-bottom:1px solid var(--line);background:#fff}
+  main{max-width:1040px;margin:24px auto;padding:0 16px;display:grid;gap:16px}
+  textarea{width:100%;min-height:100px;border:1px solid var(--line);border-radius:12px;padding:12px}
+  button{background:var(--accent);color:#fff;border:none;padding:10px 16px;border-radius:999px;cursor:pointer;font-weight:600}
+  .btn{
+    display:inline-block;
+    background:var(--accent); /* 通常のa.btnはボタンと同じ青 */
+    color:#fff;
+    text-decoration:none;
+    padding:10px 16px;
+    border-radius:999px;
+    font-weight:600;
+  }
+  .btn.csv{
+    background:var(--accent-2); /* 薄い青で差別化 */
+    color:#0f172a;
+  }
+  .card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px}
+  pre{white-space:pre-wrap;word-break:break-word}
+  table{width:100%;border-collapse:collapse;font-size:14px}
+  th,td{border-bottom:1px solid var(--line);padding:8px;text-align:left;vertical-align:top}
+  th{background:#fafafa}
+  .pill{display:inline-block;padding:2px 8px;border-radius:999px;background:#f1f5f9;color:#334155;font-size:12px}
+</style>
+</head>
+<body>
+  <header><h1>Text→Melody（ABC 記譜・対話生成）</h1></header>
+  <main>
+    <div class="card">
+      <p><strong>プロンプト例：</strong>「明るく，テンポ120bpm，Cメジャー，8小節で」「切なく，A minor，3/4でワルツ風に」など．</p>
+      <textarea id="prompt" placeholder="例：明るく元気．Cメジャーで，120bpm，8小節．"></textarea>
+      <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
+        <button id="compose">作曲する</button>
+        <button id="play">再生</button>
+        <button id="download">ABCをローカル保存（手動）</button>
+        <a id="openSaved" class="btn" href="#" target="_blank" style="display:none;">保存先を開く</a>
+        <a class="btn csv" href="http://127.0.0.1:8000/logs.csv" target="_blank">CSVでエクスポート</a>
+        <button id="reloadLogs" style="background:#16a34a">履歴を読み込む</button>
+      </div>
+      <div id="saveInfo" style="margin-top:8px;color:var(--muted)"></div>
+    </div>
+
+    <div class="card">
+      <h2>譜面プレビュー</h2>
+      <div id="paper"></div>
+    </div>
+
+    <div class="card">
+      <h2>ABC</h2>
+      <pre id="abc"></pre>
+    </div>
+
+    <div class="card">
+      <h2>履歴（最新順）</h2>
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+        <label>ページ：</label>
+        <input id="page" type="number" min="1" value="1" style="width:80px;padding:6px;border:1px solid var(--line);border-radius:8px"/>
+        <label>件数：</label>
+        <input id="perPage" type="number" min="1" max="200" value="20" style="width:80px;padding:6px;border:1px solid var(--line);border-radius:8px"/>
+        <button id="go" style="background:#475569">Go</button>
+      </div>
+      <div id="logs"></div>
+    </div>
+  </main>
+
+  <script src="https://cdn.jsdelivr.net/npm/abcjs@6.4.4/dist/abcjs-basic.min.js"></script>
+  <script>
+    let lastABC = "";
+    const paper = document.getElementById("paper");
+    const abcPre = document.getElementById("abc");
+    const promptEl = document.getElementById("prompt");
+    const saveInfo = document.getElementById("saveInfo");
+    const openSaved = document.getElementById("openSaved");
+
+    function renderABC(abc){
+      paper.innerHTML = "";
+      ABCJS.renderAbc(paper, abc, { responsive: "resize" });
+      lastABC = abc;
+      abcPre.textContent = abc;
+    }
+
+    async function fetchText(url){
+      const res = await fetch(url);
+      return await res.text();
+    }
+
+    document.getElementById("compose").addEventListener("click", async ()=>{
+      const prompt = promptEl.value.trim() || "明るく，Cメジャー，120bpm，8小節．";
+      const res = await fetch("http://127.0.0.1:8000/compose", {
+        method:"POST", headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({prompt})
+      });
+      const data = await res.json();
+      if (data.saved_url){
+        const abc = await fetchText("http://127.0.0.1:8000" + data.saved_url);
+        renderABC(abc);
+      } else {
+        renderABC(data.abc);
+      }
+      if (data.saved_url) {
+        saveInfo.textContent = `保存しました：${data.saved_file}`;
+        openSaved.href = "http://127.0.0.1:8000" + data.saved_url;
+        openSaved.style.display = "inline-block";
+      } else {
+        saveInfo.textContent = "";
+        openSaved.style.display = "none";
+      }
+    });
+
+    document.getElementById("play").addEventListener("click", async ()=>{
+      if(!lastABC){ return; }
+      const visualObj = ABCJS.renderAbc(document.createElement("div"), lastABC)[0];
+      if (!ABCJS.synth.supportsAudio()) { alert("Audio not supported."); return; }
+      const synth = new ABCJS.synth.CreateSynth();
+      await synth.init({ visualObj });
+      const audio = new ABCJS.synth.SynthController();
+      const wrap = document.createElement("div");
+      paper.appendChild(wrap);
+      audio.load(wrap, null, {displayPlay: true, displayProgress: true, displayWarp: true});
+      await synth.prime();
+      audio.setTune(visualObj, true).then(()=> audio.play() );
+    });
+
+    document.getElementById("download").addEventListener("click", ()=>{
+      if(!lastABC) return;
+      const blob = new Blob([lastABC], {type:"text/plain"});
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = "generated.abc";
+      a.click();
+    });
+
+    async function loadLogs(){
+      const page = parseInt(document.getElementById("page").value || "1");
+      const perPage = parseInt(document.getElementById("perPage").value || "20");
+      const url = `http://127.0.0.1:8000/logs?page=${page}&per_page=${perPage}`;
+      const res = await fetch(url);
+      const data = await res.json();
+      renderLogs(data);
+    }
+
+    function renderLogs(data){
+      const el = document.getElementById("logs");
+      if (!data.items || data.items.length === 0){
+        el.innerHTML = "<p>履歴がありません．</p>";
+        return;
+      }
+      let html = `<p class="pill">total: ${data.total}｜page: ${data.page}</p>`;
+      html += `<table><thead><tr>
+        <th>ID</th><th>時刻</th><th>Prompt</th><th>調/モード</th>
+        <th>拍子/小節/テンポ</th><th>ムード</th><th>音域</th>
+        <th>ノート数</th><th>保存</th><th>再表示</th>
+      </tr></thead><tbody>`;
+      for (const r of data.items){
+        const openUrl = `http://127.0.0.1:8000${r.saved_url}`;
+        html += `<tr>
+          <td>${r.id}</td>
+          <td>${r.ts}</td>
+          <td style="max-width:280px;white-space:pre-wrap">${escapeHtml(r.prompt)}</td>
+          <td>${r.key} / ${r.mode}</td>
+          <td>${r.meter} / ${r.bars} bars / ${r.tempo} bpm</td>
+          <td>${r.mood}</td>
+          <td>${r.low}–${r.high}</td>
+          <td>${r.note_count}</td>
+          <td><a href="${openUrl}" target="_blank">${r.saved_name}</a></td>
+          <td><button data-url="${openUrl}" class="reopen">開く</button></td>
+        </tr>`;
+      }
+      html += `</tbody></table>`;
+      el.innerHTML = html;
+
+      el.querySelectorAll(".reopen").forEach(btn=>{
+        btn.addEventListener("click", async ()=>{
+          const url = btn.getAttribute("data-url");
+          const abc = await (await fetch(url)).text();
+          renderABC(abc);
+          window.scrollTo({top:0,behavior:"smooth"});
+        });
+      });
+    }
+
+    function escapeHtml(s){
+      return s.replace(/[&<>"']/g, c => ({
+        "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
+      }[c]));
+    }
+
+    document.getElementById("reloadLogs").addEventListener("click", loadLogs);
+    document.getElementById("go").addEventListener("click", loadLogs);
+    loadLogs();
+  </script>
+</body>
+</html>
