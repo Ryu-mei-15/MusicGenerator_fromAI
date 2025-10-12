@@ -58,23 +58,23 @@ uvicorn
 jinja2
 numpy
 matplotlib
-2. モデル配置
+### 2. モデル配置
 models/abc_lstm.pt と models/vocab.json を配置します。
 
 
-▶️ 実行方法
-# 1. バックエンド起動
+## ▶️ 実行方法
+### 1. バックエンド起動
 bash
 コードをコピーする
 ```
 uvicorn main:app --reload
 ```
 
-# 2. ブラウザでアクセス
+### 2. ブラウザでアクセス
 cpp
 コードをコピーする
 http://127.0.0.1:8000
-# 3. 生成操作
+### 3. 生成操作
 プロンプト欄に「bright melody in C major」などを入力
 
 AI生成を使用 をONにして「生成」
@@ -101,7 +101,7 @@ main.py は自動的にルールベース生成（generate_melody()）へ切り�
 AI生成の確率構造を可視化・評価するために、
 analyze_model.py スクリプトを利用できます。
 
-# 実行方法
+### 実行方法
 bash
 コードをコピーする
 python analyze_model.py
@@ -127,16 +127,16 @@ GEN.sample(control_header, valence=0.8, arousal=0.6)
 のように呼ぶと、明るく速いメロディにバイアスがかかります。
 
 ## 🧭 再学習・強化方法
-# 1. データ拡張
+### 1.データ拡張
 既存ABCコーパスを転調（transpose）・リズムずらしで拡張
 
 make_mini_corpus.py により人工データを自動生成
 
-# 2. 再学習（例）
+### 2. 再学習（例）
 bash
 コードをコピーする
 python train_lstm.py --corpus data/abc_corpus.txt --epochs 10
-# 3. 感情制御（valence/arousal）の強化
+### 3. 感情制御（valence/arousal）の強化
 model_infer.py 内の valence_arousal_bias() を学習可能MLP化
 
 biasネットを bias_net として fine-tune（教師信号付きコーパスを用意）
