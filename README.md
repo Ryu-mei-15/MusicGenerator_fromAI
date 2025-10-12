@@ -1,6 +1,6 @@
 # 🎵 Rhythm-Linked Interaction System (Backend)
 
-音楽のOnset（発音開始）に連動して動作するインタラクションシステムのバックエンドです．  
+AIによるメロディ生成の研究用です．
 FastAPI + SQLite（SQLAlchemy）ベースで構築されています．  
 研究・実験用のプロトタイプ環境として，すぐに動かせる構成になっています．
 
