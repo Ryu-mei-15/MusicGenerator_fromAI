@@ -1,22 +1,21 @@
 # main.py
 from typing import List, Dict, Tuple, Optional
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, Query, Request, UploadFile, File, Form
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-import os, re, random, sqlite3, csv, logging
+import os, re, random, sqlite3, csv, logging, shutil, uuid, json
 from io import StringIO
 from datetime import datetime
 from urllib.parse import urljoin
 
-# ===== AI 推論モジュール（任意） =====
+# optional model_infer
 try:
     from model_infer import ABCGenerator
 except Exception:
     ABCGenerator = None
 
-# ===== ロギング =====
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("text2melody")
 
@@ -28,12 +27,15 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"],
 )
 
-# ===== static & save dir =====
+# static dirs
 SAVE_DIR = os.path.join(os.getcwd(), "ABC")
+MM_DIR = os.path.join(os.getcwd(), "MM")  # multimodal saved files
 os.makedirs(SAVE_DIR, exist_ok=True)
+os.makedirs(MM_DIR, exist_ok=True)
 app.mount("/abc", StaticFiles(directory=SAVE_DIR), name="abc")
+app.mount("/mm", StaticFiles(directory=MM_DIR), name="mm")
 
-# ===== DB =====
+# DB
 DB_PATH = os.path.join(os.getcwd(), "abc_logs.sqlite3")
 def _db():
     conn = sqlite3.connect(DB_PATH)
@@ -41,8 +43,16 @@ def _db():
     return conn
 
 def _init_db():
-    conn = _db()
-    conn.execute("""
+    """
+    DB 初期化＋既存 DB への安全なマイグレーションを行う．
+    - テーブルがなければ作成
+    - 既存テーブルにカラムが無ければ ALTER TABLE で追加（冪等）
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    # 1) 基本テーブルがなければ作成（旧スキーマとの互換を保つ）
+    cur.execute("""
     CREATE TABLE IF NOT EXISTS logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         ts TEXT NOT NULL,
@@ -61,12 +71,44 @@ def _init_db():
         note_count INTEGER NOT NULL
     )
     """)
+
+    # 2) 欠損カラムを追加するユーティリティ
+    def add_column_if_not_exists(table: str, column_def: str):
+        """
+        column_def 例: "valence REAL"
+        """
+        col_name = column_def.split()[0]
+        # SQLite の PRAGMA table_info で列一覧を取得
+        cur.execute(f"PRAGMA table_info({table})")
+        cols = [row[1] for row in cur.fetchall()]  # row[1] はカラム名
+        if col_name not in cols:
+            logger.info(f"Adding column {col_name} to {table}")
+            cur.execute(f"ALTER TABLE {table} ADD COLUMN {column_def}")
+
+    # 3) 追加したいカラム群（ここに必要カラムを列挙）
+    add_column_if_not_exists("logs", "valence REAL")
+    add_column_if_not_exists("logs", "arousal REAL")
+    add_column_if_not_exists("logs", "multimodal_audio TEXT")
+    add_column_if_not_exists("logs", "multimodal_image TEXT")
+
+    # 4) multimodal_logs テーブル（なければ作る）
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS multimodal_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT NOT NULL,
+        type TEXT NOT NULL,
+        file_path TEXT,
+        meta JSON
+    )
+    """)
+
     conn.commit()
     conn.close()
 
+
 _init_db()
 
-# ===== AI generator init =====
+# init model if available
 GEN = None
 if ABCGenerator:
     try:
@@ -76,7 +118,7 @@ if ABCGenerator:
         GEN = None
         logger.exception("Failed to init ABCGenerator")
 
-# ===== music helper (fallback) =====
+# --- music helpers (same as before) ---
 SEMITONES = {
     "C":0,"C#":1,"Db":1,"D":2,"D#":3,"Eb":3,"E":4,
     "F":5,"F#":6,"Gb":6,"G":7,"G#":8,"Ab":8,"A":9,"A#":10,"Bb":10,"B":11
@@ -187,7 +229,7 @@ def melody_to_abc(melody:List[Tuple[int,float]], params:Dict) -> str:
     if cell: body.append(" ".join(cell) + " |]")
     return "\n".join(header + [" ".join(body)])
 
-# ===== utils =====
+# utils
 def normalize_abc_text(s:str) -> str:
     if not isinstance(s, str):
         s = s.decode("utf-8", errors="ignore")
@@ -196,44 +238,47 @@ def normalize_abc_text(s:str) -> str:
     s = s.strip() + "\n"
     return s
 
-def simple_abc_check(s:str) -> Dict:
-    missing = []
-    if "X:" not in s: missing.append("X")
-    if "M:" not in s: missing.append("M")
-    if "L:" not in s: missing.append("L")
-    if "Q:" not in s: missing.append("Q")
-    if "K:" not in s: missing.append("K")
-    ok = len(missing) == 0
-    snippet = s[:600].replace("\n", "\\n")
-    return {"ok": ok, "missing": missing, "snippet": snippet}
-
 class ComposeRequest(BaseModel):
     prompt: str
-    use_ai: Optional[bool] = None  # null => server decides, True => force AI, False => force fallback
+    use_ai: Optional[bool] = None
+    valence: Optional[float] = None
+    arousal: Optional[float] = None
 
 def _safe_name(s:str) -> str:
     s = re.sub(r"[^\w\-]+", "_", s, flags=re.UNICODE)
     return re.sub(r"_+", "_", s).strip("_")
 
 def _insert_log(
-    prompt:str, params:Dict, saved_name:str, saved_url:str, saved_file:str, note_count:int
+    prompt:str, params:Dict, saved_name:str, saved_url:str, saved_file:str, note_count:int,
+    valence:Optional[float]=None, arousal:Optional[float]=None,
+    multimodal_audio:Optional[str]=None, multimodal_image:Optional[str]=None
 ) -> int:
     conn = _db()
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO logs (ts, prompt, key, mode, tempo, bars, meter, mood, low, high,
+                          valence, arousal, multimodal_audio, multimodal_image,
                           saved_name, saved_url, saved_file, note_count)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         prompt, params["key"], params["mode"], params["tempo"], params["bars"],
         params["meter"], params["mood"], params["low"], params["high"],
+        valence, arousal, multimodal_audio, multimodal_image,
         saved_name, saved_url, saved_file, note_count
     ))
     conn.commit()
     log_id = cur.lastrowid
     conn.close()
     return log_id
+
+def _insert_mm_log(type_:str, file_path:str, meta:dict):
+    conn = _db()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO multimodal_logs (ts, type, file_path, meta) VALUES (?, ?, ?, ?)",
+                (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), type_, file_path, json.dumps(meta, ensure_ascii=False)))
+    conn.commit()
+    conn.close()
 
 def build_control_header(params:Dict, prompt:str)->str:
     title = prompt.strip().replace("\n"," ")[:80]
@@ -248,7 +293,7 @@ def build_control_header(params:Dict, prompt:str)->str:
     ]
     return "\n".join(header)
 
-# ===== model status endpoint =====
+# model status
 @app.get("/model_status")
 def model_status():
     available = False
@@ -260,29 +305,68 @@ def model_status():
         info["model_loaded"] = False
     return {"available": available, "info": info}
 
-# ===== compose endpoint (use_ai respected) =====
+# multimodal upload endpoints
+@app.post("/upload_audio")
+async def upload_audio(file: UploadFile = File(...), meta: str = Form(None)):
+    # save file to MM_DIR, return public URL and log
+    ext = os.path.splitext(file.filename)[1] or ".webm"
+    name = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex}{ext}"
+    path = os.path.join(MM_DIR, name)
+    with open(path, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+    meta_obj = {}
+    if meta:
+        try:
+            meta_obj = json.loads(meta)
+        except:
+            meta_obj = {"raw_meta": meta}
+    _insert_mm_log("audio", path, meta_obj)
+    url = f"/mm/{name}"
+    return {"ok": True, "path": path, "url": url, "meta": meta_obj}
+
+@app.post("/upload_image")
+async def upload_image(file: UploadFile = File(...), meta: str = Form(None)):
+    ext = os.path.splitext(file.filename)[1] or ".png"
+    name = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex}{ext}"
+    path = os.path.join(MM_DIR, name)
+    with open(path, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+    meta_obj = {}
+    if meta:
+        try:
+            meta_obj = json.loads(meta)
+        except:
+            meta_obj = {"raw_meta": meta}
+    _insert_mm_log("image", path, meta_obj)
+    url = f"/mm/{name}"
+    return {"ok": True, "path": path, "url": url, "meta": meta_obj}
+
+# compose endpoint respects valence/arousal and multimodal flags
 @app.post("/compose")
 def compose(req: ComposeRequest, request: Request):
     params = parse_prompt(req.prompt)
+    valence = req.valence
+    arousal = req.arousal
 
     abc_text: Optional[str] = None
     ai_used = False
     debug_info = {}
 
-    want_ai = req.use_ai  # None / True / False
-
-    # Decide whether to attempt AI:
+    want_ai = req.use_ai
     attempt_ai = False
     if want_ai is True:
         attempt_ai = True
     elif want_ai is False:
         attempt_ai = False
-    else:  # want_ai is None
+    else:
         attempt_ai = True if (GEN and getattr(GEN, "ok", False)) else False
 
     if attempt_ai and GEN and getattr(GEN, "ok", False):
         try:
             control = build_control_header(params, req.prompt)
+            # we can append valence/arousal as tags into control header for conditioning
+            if valence is not None or arousal is not None:
+                control += f"%VALENCE:{valence if valence is not None else ''} ARousal:{arousal if arousal is not None else ''}\n"
             sampled = GEN.sample(control_header=control, max_len=1200, temperature=0.95, top_p=0.9)
             if sampled and isinstance(sampled, str) and sampled.strip():
                 abc_text = normalize_abc_text(control + sampled)
@@ -294,13 +378,12 @@ def compose(req: ComposeRequest, request: Request):
             logger.exception("AI generation failed")
             debug_info["ai_error"] = str(e)
 
-    # fallback
     if not abc_text:
         melody = generate_melody(params)
         abc_text = normalize_abc_text(melody_to_abc(melody, params))
         debug_info["fallback"] = "rule_based"
 
-    # save file
+    # save ABC
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     base = f"{params['key']}_{params['mode']}_{params['tempo']}bpm_{params['bars']}bars"
     fname = f"{ts}_{_safe_name(base)}.abc"
@@ -316,13 +399,16 @@ def compose(req: ComposeRequest, request: Request):
     saved_url_abs = urljoin(base_url, f"abc/{fname}")
     saved_url_rel = f"/abc/{fname}"
 
-    check = simple_abc_check(abc_text)
     note_count = sum(abc_text.count(ch) for ch in list("ABCDEFG"))
 
+    # For now we do not attempt to attach multimodal file paths here, front-end should call upload endpoints and then pass URLs in metadata if desired
+    multimodal_audio = None
+    multimodal_image = None
+
     log_id = _insert_log(
-        prompt=req.prompt, params=params,
-        saved_name=fname, saved_url=saved_url_rel,
-        saved_file=fpath, note_count=note_count
+        prompt=req.prompt, params=params, saved_name=fname, saved_url=saved_url_rel, saved_file=fpath,
+        note_count=note_count, valence=valence, arousal=arousal,
+        multimodal_audio=multimodal_audio, multimodal_image=multimodal_image
     )
 
     resp = {
@@ -336,24 +422,18 @@ def compose(req: ComposeRequest, request: Request):
         "log_id": log_id,
         "ai_used": ai_used,
         "attempted_ai": attempt_ai,
-        "render_ok": check["ok"],
-        "render_missing": check["missing"],
-        "abc_head_snippet": check["snippet"],
-        "debug_info": debug_info,
-        "attempted_ai": attempt_ai
+        "debug_info": debug_info
     }
 
-    logger.info(f"compose done id={log_id} ai_used={ai_used} attempted_ai={attempt_ai} saved={fname} render_ok={check['ok']}")
+    logger.info(f"compose done id={log_id} ai_used={ai_used} attempted_ai={attempt_ai} saved={fname}")
     return JSONResponse(resp)
 
-# ===== logs endpoints (unchanged) =====
+# logs endpoint
 @app.get("/logs")
-def get_logs(page:int = Query(1, ge=1), per_page:int = Query(20, ge=1, le=200)):
+def get_logs(page:int = Query(1, ge=1), per_page:int = Query(1, ge=1, le=200)):
     offset = (page - 1) * per_page
     conn = _db()
-    rows = conn.execute(
-        "SELECT * FROM logs ORDER BY id DESC LIMIT ? OFFSET ?", (per_page, offset)
-    ).fetchall()
+    rows = conn.execute("SELECT * FROM logs ORDER BY id DESC LIMIT ? OFFSET ?", (per_page, offset)).fetchall()
     total = conn.execute("SELECT COUNT(*) AS c FROM logs").fetchone()["c"]
     conn.close()
     items = [dict(r) for r in rows]
@@ -364,19 +444,15 @@ def download_logs_csv():
     conn = _db()
     rows = conn.execute("SELECT * FROM logs ORDER BY id DESC").fetchall()
     conn.close()
-
     buff = StringIO()
     writer = csv.writer(buff)
     headers = rows[0].keys() if rows else [
         "id","ts","prompt","key","mode","tempo","bars","meter","mood","low","high",
+        "valence","arousal","multimodal_audio","multimodal_image",
         "saved_name","saved_url","saved_file","note_count"
     ]
     writer.writerow(headers)
     for r in rows:
         writer.writerow([r[h] for h in headers])
     buff.seek(0)
-
-    return StreamingResponse(
-        buff, media_type="text/csv",
-        headers={"Content-Disposition":"attachment; filename=abc_logs.csv"}
-    )
+    return StreamingResponse(buff, media_type="text/csv", headers={"Content-Disposition":"attachment; filename=abc_logs.csv"})

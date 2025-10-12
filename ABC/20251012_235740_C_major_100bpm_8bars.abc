@@ -1,0 +1,14 @@
+X:1
+T:Prompt: 深夜作業中に眠くなった人が元気が出て目が覚める曲
+M:4/4
+L:1/8
+Q:1/4=100
+K:C
+
+%VALENCE:0.6 ARousal:1.0
+T:Seed 30
+M:4/4
+L:1/8
+Q:1/4=110
+K:G
+GABc d2 e2 | dBAG E2 D2 | ]
