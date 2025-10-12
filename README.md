@@ -84,6 +84,7 @@ AIが model_infer.ABCGenerator.sample() を呼び出し、ABCメロディを生�
 結果が画面下に出力され、コピーまたは保存可能
 
 ## 💡 AI生成の流れ
+## 💡 AI生成の流れ
 ユーザー入力から build_control_header() によりコントロールヘッダを作成
 
 ABCGenerator.sample() が呼び出される
@@ -93,10 +94,12 @@ LSTMモデルにより逐次トークンを生成（確率分布→top-pサン�
 結果をABC形式文字列として返却
 
 ## 🎼 非AIフォールバック
+## 🎼 非AIフォールバック
 もしモデルがロードできない場合（例：models/ が存在しないとき）、
 main.py は自動的にルールベース生成（generate_melody()）へ切り替えます。
 この場合はAIを使わず、確率的な規則ベースでメロディを生成します。
 
+## 🔬 分析・可視化ツール
 ## 🔬 分析・可視化ツール
 AI生成の確率構造を可視化・評価するために、
 analyze_model.py スクリプトを利用できます。
@@ -111,6 +114,7 @@ python analyze_model.py
 
 結果は analysis_out/ に PNG / CSV で保存されます。
 
+## 💞 感情パラメータ（Valence / Arousal）
 ## 💞 感情パラメータ（Valence / Arousal）
 model_infer.py の ABCGenerator.sample() は
 感情パラメータによる生成バイアスに対応しています。
@@ -143,6 +147,7 @@ biasネットを bias_net として fine-tune（教師信号付きコーパス�
 
 評価時に valence / arousal を調整し出力傾向を比較
 
+## 📊 評価指標（例）
 ## 📊 評価指標（例）
 指標	内容
 トークン多様性	一意トークン数 / 総トークン数
@@ -178,10 +183,10 @@ Transformer系モデルへの置換（ABC Transformer）
 
 主観評価実験による感情制御精度の検証
 
-👨‍🔬 作者 / 開発背景
+## 👨‍🔬 作者 / 開発背景
 本システムは、生成AIを用いたメロディの対話的生成 研究の一環として構築されました。
 インタラクティブな作曲支援と、AIモデルの「感情的生成傾向」の解析を目的としています。
 
-研究キーワード：
+## 研究キーワード：
 
 LSTM, Music Generation, ABC Notation, Valence-Arousal, FastAPI, Interactive Composition
