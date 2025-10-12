@@ -1,36 +1,40 @@
+# main.py
 from typing import List, Dict, Tuple, Optional
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Request
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-import os, re, random, sqlite3, csv
+import os, re, random, sqlite3, csv, logging
 from io import StringIO
 from datetime import datetime
+from urllib.parse import urljoin
 
-# ===== AI 推論モジュール =====
-from model_infer import ABCGenerator
+# ===== AI 推論モジュール（任意） =====
+try:
+    from model_infer import ABCGenerator
+except Exception:
+    ABCGenerator = None
 
-# FastAPI 起動時にジェネレータ用意（models/ があれば AI 生成 ON）
-GEN = ABCGenerator()
+# ===== ロギング =====
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("text2melody")
 
 app = FastAPI(title="Text2Melody ABC")
 
-# ===== CORS =====
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"],
 )
 
-# ===== 保存ディレクトリ（カレント/ABC）＆静的配信 =====
+# ===== static & save dir =====
 SAVE_DIR = os.path.join(os.getcwd(), "ABC")
 os.makedirs(SAVE_DIR, exist_ok=True)
 app.mount("/abc", StaticFiles(directory=SAVE_DIR), name="abc")
 
-# ===== SQLite 準備 =====
+# ===== DB =====
 DB_PATH = os.path.join(os.getcwd(), "abc_logs.sqlite3")
-
 def _db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -62,7 +66,17 @@ def _init_db():
 
 _init_db()
 
-# ===== 音階定義・従来ロジック（フォールバック用） =====
+# ===== AI generator init =====
+GEN = None
+if ABCGenerator:
+    try:
+        GEN = ABCGenerator()
+        logger.info(f"ABCGenerator loaded, ok={getattr(GEN, 'ok', False)}")
+    except Exception as e:
+        GEN = None
+        logger.exception("Failed to init ABCGenerator")
+
+# ===== music helper (fallback) =====
 SEMITONES = {
     "C":0,"C#":1,"Db":1,"D":2,"D#":3,"Eb":3,"E":4,
     "F":5,"F#":6,"Gb":6,"G":7,"G#":8,"Ab":8,"A":9,"A#":10,"Bb":10,"B":11
@@ -79,7 +93,7 @@ def midi_to_abc_pitch(midi_num:int) -> str:
             name = k
             break
     if name is None: name = "C"
-    delta = octave - 4  # C4 を基準
+    delta = octave - 4
     if delta == 0:
         base = name.upper()
     elif delta > 0:
@@ -158,7 +172,7 @@ def melody_to_abc(melody:List[Tuple[int,float]], params:Dict) -> str:
     cell = []; cells_in_bar = 0
     for midi, qlen in melody:
         abc_note = midi_to_abc_pitch(midi)
-        units = round(qlen / unit)  # 0.5→1，1.0→2，0.25→/2≈0
+        units = round(qlen / unit)
         if units == 1:   token = abc_note
         elif units == 2: token = f"{abc_note}2"
         elif units == 3: token = f"{abc_note}3"
@@ -173,9 +187,29 @@ def melody_to_abc(melody:List[Tuple[int,float]], params:Dict) -> str:
     if cell: body.append(" ".join(cell) + " |]")
     return "\n".join(header + [" ".join(body)])
 
-# ===== モデル I/O =====
+# ===== utils =====
+def normalize_abc_text(s:str) -> str:
+    if not isinstance(s, str):
+        s = s.decode("utf-8", errors="ignore")
+    s = s.lstrip('\ufeff')
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    s = s.strip() + "\n"
+    return s
+
+def simple_abc_check(s:str) -> Dict:
+    missing = []
+    if "X:" not in s: missing.append("X")
+    if "M:" not in s: missing.append("M")
+    if "L:" not in s: missing.append("L")
+    if "Q:" not in s: missing.append("Q")
+    if "K:" not in s: missing.append("K")
+    ok = len(missing) == 0
+    snippet = s[:600].replace("\n", "\\n")
+    return {"ok": ok, "missing": missing, "snippet": snippet}
+
 class ComposeRequest(BaseModel):
     prompt: str
+    use_ai: Optional[bool] = None  # null => server decides, True => force AI, False => force fallback
 
 def _safe_name(s:str) -> str:
     s = re.sub(r"[^\w\-]+", "_", s, flags=re.UNICODE)
@@ -202,9 +236,6 @@ def _insert_log(
     return log_id
 
 def build_control_header(params:Dict, prompt:str)->str:
-    """
-    学習時にも自然に見える条件付き ABC ヘッダを作る．
-    """
     title = prompt.strip().replace("\n"," ")[:80]
     header = [
         "X:1",
@@ -217,50 +248,105 @@ def build_control_header(params:Dict, prompt:str)->str:
     ]
     return "\n".join(header)
 
-# ===== 作曲エンドポイント（AI→フォールバック） =====
+# ===== model status endpoint =====
+@app.get("/model_status")
+def model_status():
+    available = False
+    info = {}
+    if GEN:
+        available = getattr(GEN, "ok", False)
+        info["model_loaded"] = available
+    else:
+        info["model_loaded"] = False
+    return {"available": available, "info": info}
+
+# ===== compose endpoint (use_ai respected) =====
 @app.post("/compose")
-def compose(req: ComposeRequest):
+def compose(req: ComposeRequest, request: Request):
     params = parse_prompt(req.prompt)
 
-    # AI 生成（学習済みがあれば）
     abc_text: Optional[str] = None
-    if GEN.ok:
-        control = build_control_header(params, req.prompt)
-        sampled = GEN.sample(control_header=control, max_len=1200, temperature=0.95, top_p=0.9)
-        if sampled:
-            abc_text = control + sampled
+    ai_used = False
+    debug_info = {}
 
-    # フォールバック（従来ロジック）
-    if abc_text is None:
+    want_ai = req.use_ai  # None / True / False
+
+    # Decide whether to attempt AI:
+    attempt_ai = False
+    if want_ai is True:
+        attempt_ai = True
+    elif want_ai is False:
+        attempt_ai = False
+    else:  # want_ai is None
+        attempt_ai = True if (GEN and getattr(GEN, "ok", False)) else False
+
+    if attempt_ai and GEN and getattr(GEN, "ok", False):
+        try:
+            control = build_control_header(params, req.prompt)
+            sampled = GEN.sample(control_header=control, max_len=1200, temperature=0.95, top_p=0.9)
+            if sampled and isinstance(sampled, str) and sampled.strip():
+                abc_text = normalize_abc_text(control + sampled)
+                ai_used = True
+                debug_info["ai_note"] = "generated_by_model"
+            else:
+                debug_info["ai_note"] = "model returned empty"
+        except Exception as e:
+            logger.exception("AI generation failed")
+            debug_info["ai_error"] = str(e)
+
+    # fallback
+    if not abc_text:
         melody = generate_melody(params)
-        abc_text = melody_to_abc(melody, params)
+        abc_text = normalize_abc_text(melody_to_abc(melody, params))
+        debug_info["fallback"] = "rule_based"
 
-    # 保存
+    # save file
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     base = f"{params['key']}_{params['mode']}_{params['tempo']}bpm_{params['bars']}bars"
     fname = f"{ts}_{_safe_name(base)}.abc"
     fpath = os.path.join(SAVE_DIR, fname)
-    with open(fpath, "w", encoding="utf-8") as f:
-        f.write(abc_text)
-    saved_url = f"/abc/{fname}"
+    try:
+        with open(fpath, "w", encoding="utf-8") as f:
+            f.write(abc_text)
+    except Exception as e:
+        logger.exception("Failed to write ABC file")
+        return JSONResponse({"error":"failed_to_save","detail":str(e)}, status_code=500)
 
-    # 簡易ノート数推定（ABC文字からの粗カウント）
+    base_url = str(request.base_url)
+    saved_url_abs = urljoin(base_url, f"abc/{fname}")
+    saved_url_rel = f"/abc/{fname}"
+
+    check = simple_abc_check(abc_text)
     note_count = sum(abc_text.count(ch) for ch in list("ABCDEFG"))
 
     log_id = _insert_log(
         prompt=req.prompt, params=params,
-        saved_name=fname, saved_url=saved_url,
+        saved_name=fname, saved_url=saved_url_rel,
         saved_file=fpath, note_count=note_count
     )
 
-    return JSONResponse({
-        "abc": abc_text, "params": params,
-        "saved_file": fpath, "saved_name": fname, "saved_url": saved_url,
-        "note_count": note_count, "log_id": log_id,
-        "ai_used": GEN.ok
-    })
+    resp = {
+        "abc": abc_text,
+        "params": params,
+        "saved_file": fpath,
+        "saved_name": fname,
+        "saved_url": saved_url_rel,
+        "saved_url_abs": saved_url_abs,
+        "note_count": note_count,
+        "log_id": log_id,
+        "ai_used": ai_used,
+        "attempted_ai": attempt_ai,
+        "render_ok": check["ok"],
+        "render_missing": check["missing"],
+        "abc_head_snippet": check["snippet"],
+        "debug_info": debug_info,
+        "attempted_ai": attempt_ai
+    }
 
-# ===== ログ取得：JSON（ページング対応） =====
+    logger.info(f"compose done id={log_id} ai_used={ai_used} attempted_ai={attempt_ai} saved={fname} render_ok={check['ok']}")
+    return JSONResponse(resp)
+
+# ===== logs endpoints (unchanged) =====
 @app.get("/logs")
 def get_logs(page:int = Query(1, ge=1), per_page:int = Query(20, ge=1, le=200)):
     offset = (page - 1) * per_page
@@ -273,7 +359,6 @@ def get_logs(page:int = Query(1, ge=1), per_page:int = Query(20, ge=1, le=200)):
     items = [dict(r) for r in rows]
     return {"page": page, "per_page": per_page, "total": total, "items": items}
 
-# ===== ログ全件：CSV ダウンロード =====
 @app.get("/logs.csv")
 def download_logs_csv():
     conn = _db()
