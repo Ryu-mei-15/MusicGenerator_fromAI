@@ -84,6 +84,26 @@
         <a id="openSaved" class="btn" href="#" target="_blank" style="display:none">保存を開く</a>
         <a class="btn csv" href="http://127.0.0.1:8000/logs.csv" target="_blank">CSVでエクスポート</a>
         <button id="reloadLogs" style="background:#16a34a">履歴を読み込む</button>
+        <button id="runAnalysis">モデル解析を実行</button>
+          <pre id="analysisLog"></pre>
+
+          <script>
+          document.getElementById("runAnalysis").addEventListener("click", async ()=>{
+            const log = document.getElementById("analysisLog");
+            log.textContent = "解析を開始しました…（サーバーで実行）";
+            try {
+              const res = await fetch("http://127.0.0.1:8000/run_analysis", { method: "POST" });
+              const j = await res.json();
+              if (j.ok) {
+                log.textContent = "完了:\n" + j.stdout;
+              } else {
+                log.textContent = "失敗:\n" + (j.stderr || JSON.stringify(j));
+              }
+            } catch(e){
+              log.textContent = "エラー: " + e;
+            }
+          });
+          </script>
       </div>
 
       <div id="saveInfo" class="mutedSmall" style="margin-top:8px"></div>

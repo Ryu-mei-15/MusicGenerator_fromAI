@@ -5,7 +5,7 @@ from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-import os, re, random, sqlite3, csv, logging, shutil, uuid, json
+import os, re, random, sqlite3, csv, logging, shutil, uuid, json, subprocess, threading, sys
 from io import StringIO
 from datetime import datetime
 from urllib.parse import urljoin
@@ -456,3 +456,13 @@ def download_logs_csv():
         writer.writerow([r[h] for h in headers])
     buff.seek(0)
     return StreamingResponse(buff, media_type="text/csv", headers={"Content-Disposition":"attachment; filename=abc_logs.csv"})
+
+@app.post("/run_analysis")
+def run_analysis():
+    # 注意: 解析は時間がかかる可能性があるため、実運用では非同期ジョブキューが望ましい。
+    script = os.path.join(os.getcwd(), "analyze_model.py")
+    if not os.path.exists(script):
+        return {"ok": False, "error": "analyze_model.py not found"}
+    # 同期実行（ブロッキング）
+    proc = subprocess.run([sys.executable, script], capture_output=True, text=True)
+    return {"ok": proc.returncode==0, "stdout": proc.stdout, "stderr": proc.stderr}
