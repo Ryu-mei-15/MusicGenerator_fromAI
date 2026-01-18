@@ -1,7 +1,7 @@
 # main.py
 from typing import List, Dict, Tuple, Optional
 from fastapi import FastAPI, Query, Request, UploadFile, File, Form
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -151,20 +151,58 @@ def build_scale(key:str, mode:str) -> List[int]:
 
 def parse_prompt(prompt:str) -> Dict:
     txt = prompt.lower()
-    m_key = re.search(r"(c|c#|db|d|d#|eb|e|f|f#|gb|g|g#|ab|a|a#|bb|b)\s*(major|minor|maj|min|メジャー|マイナー)?", txt)
-    key = (m_key.group(1).upper() if m_key else "C")
+
+    # Key and Mode
+    key_map = {
+        "ハ": "C", "ニ": "D", "ホ": "E", "ヘ": "F", "ト": "G", "イ": "A", "ロ": "B",
+    }
+    key_pattern = r"([a-g][#b]?|ハ|ニ|ホ|ヘ|ト|イ|ロ)\s*(長調|短調|major|minor|maj|min|メジャー|マイナー)?"
+    m_key = re.search(key_pattern, txt)
+
+    key = "C"
     mode = "major"
-    if m_key and m_key.group(2):
-        if "min" in m_key.group(2) or "マイナー" in m_key.group(2):
-            mode = "minor"
-    mood = "bright" if ("bright" in txt or "明る" in txt or "元気" in txt) else ("sad" if ("sad" in txt or "哀" in txt or "切な" in txt) else "neutral")
+    if m_key:
+        key_str = m_key.group(1)
+        key_candidate = key_map.get(key_str, key_str)
+        if len(key_candidate) > 1:
+            key = key_candidate[0].upper() + key_candidate[1]
+        else:
+            key = key_candidate.upper()
+
+        if m_key.group(2) and any(s in m_key.group(2) for s in ["短調", "minor", "min", "マイナー"]):
+                mode = "minor"
+
+    # Mood
+    bright_words = ["bright", "happy", "cheerful", "joyful", "energetic", "明る", "元気", "楽しい", "嬉しい", "陽気"]
+    sad_words = ["sad", "dark", "melancholic", "哀", "切な", "悲しい", "寂しい", "ダーク"]
+    calm_words = ["calm", "peaceful", "relaxed", "穏やか", "落ち着いた", "リラックス"]
+    mood = "neutral"
+    if any(word in txt for word in bright_words): mood = "bright"
+    elif any(word in txt for word in sad_words): mood = "sad"
+    elif any(word in txt for word in calm_words): mood = "calm"
+
+    # Tempo
     m_tempo = re.search(r"(bpm|tempo)\s*[:=]?\s*(\d+)", txt) or re.search(r"(\d+)\s*bpm", txt)
-    tempo = int(m_tempo.group(2) if m_tempo and len(m_tempo.groups())>=2 else (m_tempo.group(1) if m_tempo else 100))
+    tempo = 100
+    if m_tempo:
+        tempo = int(m_tempo.group(2) if m_tempo and len(m_tempo.groups())>=2 else (m_tempo.group(1) if m_tempo else 100))
+    elif any(w in txt for w in ["fast", "速く", "アップテンポ"]): tempo = 140
+    elif any(w in txt for w in ["slow", "ゆっくり", "スロー", "バラード"]): tempo = 70
+
+    # Bars
     m_bars = re.search(r"(bars?|小節)\s*[:=]?\s*(\d+)", txt)
-    bars = int(m_bars.group(2) if m_bars else 8)
+    bars = 8
+    if m_bars: bars = int(m_bars.group(2))
+    elif "long" in txt or "長く" in txt: bars = 16
+    elif "short" in txt or "短く" in txt: bars = 4
+
+    # Meter
     meter = "4/4"
-    if "3/4" in txt or "waltz" in txt or "ワルツ" in txt:
-        meter = "3/4"
+    if any(s in txt for s in ["3/4", "waltz", "ワルツ"]): meter = "3/4"
+    elif "2/4" in txt: meter = "2/4"
+    elif "6/8" in txt: meter = "6/8"
+
+    # Pitch Range
     low = 55; high = 77
     if "高め" in txt or "high" in txt: low, high = 64, 79
     if "低め" in txt or "low" in txt:  low, high = 52, 67
@@ -180,15 +218,30 @@ def generate_melody(params:Dict) -> List[Tuple[int, float]]:
         if delta < -6: delta += 12
         return m + delta
     cur = snap_to_scale(random.randint(params["low"], params["high"]))
-    q_per_bar = 3 if params["meter"]=="3/4" else 4
+
+    try:
+        num, den = map(int, params["meter"].split('/'))
+        q_per_bar = num * (4 / den)
+    except (ValueError, ZeroDivisionError):
+        q_per_bar = 4
+
     total_q = params["bars"] * q_per_bar
     if params["mood"]=="bright":
         step_probs = [ -2,-1,0,1,2,3,5 ]; weights = [1,3,2,4,3,2,1]
     elif params["mood"]=="sad":
         step_probs = [ -5,-3,-2,-1,0,1,2 ]; weights = [1,2,3,4,2,2,1]
+    elif params["mood"]=="calm":
+        step_probs = [ -2,-1,0,1,2 ]; weights = [3,4,1,4,3]
     else:
         step_probs = [ -3,-2,-1,0,1,2,3 ]; weights = [2,3,4,2,4,3,2]
-    dur_candidates = [0.5,0.5,0.5,1.0,1.0,0.25,0.75]
+
+    if params["meter"] == "6/8":
+        dur_candidates = [0.5, 0.5, 0.5, 0.75, 1.0, 1.5]
+    elif params["meter"] == "3/4":
+        dur_candidates = [0.5, 0.5, 1.0, 1.0, 1.5, 2.0]
+    else: # 4/4, 2/4 etc.
+        dur_candidates = [0.25, 0.5, 0.5, 0.75, 1.0, 1.0, 1.5, 2.0]
+
     melody : List[Tuple[int,float]] = []
     q_sum = 0.0
     while q_sum < total_q - 1e-6:
@@ -197,6 +250,7 @@ def generate_melody(params:Dict) -> List[Tuple[int, float]]:
         nxt = snap_to_scale(nxt)
         dur = random.choice(dur_candidates)
         if q_sum + dur > total_q: dur = total_q - q_sum
+        if dur < 1e-6: break
         melody.append((nxt, dur))
         cur = nxt; q_sum += dur
     return melody
@@ -209,23 +263,36 @@ def melody_to_abc(melody:List[Tuple[int,float]], params:Dict) -> str:
         f"K:{params['key']}{'' if params['mode']=='major' else 'min'}"
     ]
     body = []
-    unit = 0.5
-    count_in_bar = 6 if params["meter"]=="3/4" else 8
-    cell = []; cells_in_bar = 0
+    unit = 0.5  # L:1/8 -> unit is 8th note
+
+    try:
+        num, den = map(int, params["meter"].split('/'))
+        count_in_bar = num * (8 / den)
+    except (ValueError, ZeroDivisionError):
+        count_in_bar = 8.0
+
+    cell = []; cells_in_bar = 0.0
     for midi, qlen in melody:
         abc_note = midi_to_abc_pitch(midi)
-        units = round(qlen / unit)
-        if units == 1:   token = abc_note
-        elif units == 2: token = f"{abc_note}2"
-        elif units == 3: token = f"{abc_note}3"
-        elif units == 4: token = f"{abc_note}4"
-        elif units == 0: token = f"{abc_note}/2"
-        else:            token = f"{abc_note}{units}"
+        units = qlen / unit
+
+        if abs(units - 1) < 1e-6: token = abc_note
+        elif abs(units - 2) < 1e-6: token = f"{abc_note}2"
+        elif abs(units - 3) < 1e-6: token = f"{abc_note}3"
+        elif abs(units - 4) < 1e-6: token = f"{abc_note}4"
+        elif abs(units - 0.5) < 1e-6: token = f"{abc_note}/2"
+        elif abs(units - 1.5) < 1e-6: token = f"{abc_note}3/2"
+        else:
+            int_units = max(1, int(round(units)))
+            token = f"{abc_note}{int_units}" if int_units != 1 else abc_note
+
         cell.append(token)
-        cells_in_bar += units if units>0 else 1
-        if cells_in_bar >= count_in_bar:
+        cells_in_bar += units
+        if cells_in_bar >= count_in_bar - 1e-6:
             body.append(" ".join(cell) + " |")
-            cell = []; cells_in_bar = 0
+            cell = []
+            cells_in_bar -= count_in_bar
+            if cells_in_bar < 1e-6: cells_in_bar = 0
     if cell: body.append(" ".join(cell) + " |]")
     return "\n".join(header + [" ".join(body)])
 
@@ -243,6 +310,13 @@ class ComposeRequest(BaseModel):
     use_ai: Optional[bool] = None
     valence: Optional[float] = None
     arousal: Optional[float] = None
+    # UIから直接パラメータを指定するためのフィールドを追加
+    key: Optional[str] = Field(None, description="例: C, G#, Bb")
+    mode: Optional[str] = Field(None, description="major または minor")
+    tempo: Optional[int] = Field(None, ge=30, le=240, description="BPM (30-240)")
+    bars: Optional[int] = Field(None, ge=2, le=64, description="小節数 (2-64)")
+    meter: Optional[str] = Field(None, description="拍子. 例: 4/4, 3/4, 6/8")
+    mood: Optional[str] = Field(None, description="曲の雰囲気. 例: bright, sad, calm")
 
 def _safe_name(s:str) -> str:
     s = re.sub(r"[^\w\-]+", "_", s, flags=re.UNICODE)
@@ -344,7 +418,17 @@ async def upload_image(file: UploadFile = File(...), meta: str = Form(None)):
 # compose endpoint respects valence/arousal and multimodal flags
 @app.post("/compose")
 def compose(req: ComposeRequest, request: Request):
+    # 1. プロンプトから基本パラメータをパース
     params = parse_prompt(req.prompt)
+
+    # 2. リクエストで直接指定されたパラメータで上書き
+    if req.key: params["key"] = req.key
+    if req.mode: params["mode"] = req.mode
+    if req.tempo: params["tempo"] = req.tempo
+    if req.bars: params["bars"] = req.bars
+    if req.meter: params["meter"] = req.meter
+    if req.mood: params["mood"] = req.mood
+
     valence = req.valence
     arousal = req.arousal
 
